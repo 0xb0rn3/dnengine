@@ -1,0 +1,26 @@
+[package]
+name = "dnengine"
+version = "0.1.0"
+edition = "2021"
+description = "The ArxOS download engine: many connections, every network, resumable, verified"
+license = "MIT"
+repository = "https://github.com/0xb0rn3/dnengine"
+
+# No dependencies. Every ArxOS tool that fetches something links or calls this, including the ones
+# that run on a machine with nothing installed yet, so the engine has to build from std alone.
+# rlib for Rust callers, cdylib for C/Python/Go through the C ABI, staticlib for anything that
+# wants to bake it in. One engine, every language.
+[lib]
+name = "dnengine"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "dn"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

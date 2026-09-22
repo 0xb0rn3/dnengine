@@ -1,0 +1,9 @@
+[package]
+name = "rust-app"
+version = "0.1.0"
+edition = "2021"
+
+# A Rust program links the crate itself rather than going through the C ABI: same engine, but
+# the types come with it.
+[dependencies]
+dnengine = { path = "../.." }
