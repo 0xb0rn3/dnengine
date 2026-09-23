@@ -23,6 +23,7 @@
 //! It is std only on purpose, so it builds on a machine with nothing installed and an empty cargo
 //! cache, which is often exactly the machine that needs to fetch something.
 
+pub mod batch;
 pub mod ffi;
 pub mod json;
 pub mod netif;

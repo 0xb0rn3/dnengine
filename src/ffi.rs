@@ -121,6 +121,56 @@ pub unsafe extern "C" fn dn_download(
 }
 
 /// The last error, valid until the next call on this thread's behalf. Never NULL.
+/// Fetch many files in one batch, reusing connections across them.
+///
+/// This is the entry point for the workload the range splitter cannot help: lots of small files.
+/// `urls` and `dests` are parallel arrays of `count` NUL terminated strings. Returns the number
+/// that succeeded, or -1 on a setup failure, with dn_last_error() holding the reason.
+///
+/// Callers in other languages get the connection reuse for free: the whole batch is one transfer
+/// process with one pool, instead of one process per file.
+#[no_mangle]
+pub extern "C" fn dn_fetch_many(
+    urls: *const *const c_char, dests: *const *const c_char, count: c_int,
+    parallel: c_int, progress: DnProgress, user: *mut c_void,
+) -> c_int {
+    // the user pointer is opaque to us and only handed back to the caller's own callback
+    let user = user as usize;
+    let r = std::panic::catch_unwind(move || {
+        if urls.is_null() || dests.is_null() || count <= 0 { return 0; }
+        let mut items = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            // SAFETY: the caller promises `count` valid pointers in each array; both are read
+            // only here and nothing is retained past this call.
+            let (u, d) = unsafe { (*urls.add(i), *dests.add(i)) };
+            if u.is_null() || d.is_null() { set_error("null url or destination in the batch"); return -1; }
+            let url = match unsafe { CStr::from_ptr(u) }.to_str() {
+                Ok(v) => v.to_string(),
+                Err(_) => { set_error("url is not valid utf-8"); return -1; }
+            };
+            let dest = match unsafe { CStr::from_ptr(d) }.to_str() {
+                Ok(v) => std::path::PathBuf::from(v),
+                Err(_) => { set_error("destination is not valid utf-8"); return -1; }
+            };
+            items.push(crate::batch::Item { url, dest });
+        }
+        let opts = crate::batch::BatchOpts {
+            parallel: if parallel > 0 { parallel as usize } else { 8 },
+            ..Default::default()
+        };
+        match crate::batch::fetch_many(&items, &opts, |done, total| {
+            match progress {
+                Some(f) => f(done as u64, total as u64, 0, 0, user as *mut c_void) == 0,
+                None => true,
+            }
+        }) {
+            Ok(r) => r.ok as c_int,
+            Err(e) => { set_error(&e); -1 }
+        }
+    });
+    match r { Ok(v) => v, Err(_) => { set_error("dn_fetch_many panicked"); -1 } }
+}
+
 #[no_mangle]
 pub extern "C" fn dn_last_error() -> *const c_char {
     static EMPTY: &[u8] = b"\0";
