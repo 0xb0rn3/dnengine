@@ -30,8 +30,8 @@ cargo build --release
 # target/release/libdnengine.a    same, static
 ```
 
-No dependencies, deliberately: this is what `arx` will use to fetch packages on a machine that
-has just been installed. Adding a crate to it is a decision, not a convenience.
+No dependencies, deliberately: this gets called on machines that have just been installed, or
+that are being rescued. Adding a crate to it is a decision, not a convenience.
 
 ## Test
 

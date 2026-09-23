@@ -164,7 +164,7 @@ public, and give the pool its own disk or quota.
 ## Choosing
 
 Start with the **local process**: it is the least coupling for the most benefit, and it is how
-`arxburn` uses the engine. Move to **compiled in** when you want the progress inside your own
+`arxburn` (one of the programs that uses this) does it. Move to **compiled in** when you want the progress inside your own
 window, or when starting a process per download is genuinely too much. Use **over the network**
 when the bandwidth and the program are on different machines.
 

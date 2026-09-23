@@ -1,4 +1,4 @@
-//! dnengine: the ArxOS download engine.
+//! dnengine: a download engine that uses every connection you have.
 //!
 //! One file, many connections, every network the machine has, and every mirror that serves it,
 //! all at once. Resumable, and verified against a hash when you have one.
@@ -18,9 +18,10 @@
 //!   5. integrity   the bytes are hashed as they are written, and checked against what the
 //!                  project published.
 //!
-//! Every ArxOS tool that fetches something is meant to use this: `arx` for packages, arxburn for
-//! images, the kernel updater for releases. It is std only on purpose, so it builds on a machine
-//! with nothing installed and an empty cargo cache.
+//! This is meant to be used by other programs rather than typed by a person, the way aria2 or
+//! libcurl are: link the crate, link the C ABI, run the `dn` binary, or drive it over a socket.
+//! It is std only on purpose, so it builds on a machine with nothing installed and an empty cargo
+//! cache, which is often exactly the machine that needs to fetch something.
 
 pub mod ffi;
 pub mod json;

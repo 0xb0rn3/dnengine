@@ -1,17 +1,19 @@
 # dnengine
 
-The ArxOS download engine. One file, many connections, every network the machine has, and every
-mirror that serves it, all at once. Resumable, and checked against a hash.
+A download engine that uses every connection you have. One file, many connections, every network
+interface on the machine, and every mirror that serves it, all at once. Resumable, and checked
+against a hash.
 
-Every ArxOS tool that fetches something is meant to call this instead of writing its own
-downloader: `arx` for packages, `arxburn` for images, the kernel updater for releases. It is
-std-only Rust with no crate dependencies, so it builds on a machine with nothing installed and an
-empty cargo cache, and it exposes a plain C ABI so it is not a Rust-only thing.
+It is meant to be used by other programs, the way aria2 or libcurl are: link it, call the `dn`
+binary, or point a thin client at it over a socket. It is std-only Rust with no crate
+dependencies, so it builds on a machine with nothing installed and an empty cargo cache, and it
+exposes a plain C ABI so C, C++, Go, Python and anything else with an FFI can use the same
+engine.
 
 ```sh
-dn get https://mirror.example/arxos.iso -o arxos.iso --expect 18d87568...
+dn get https://mirror.example/big.iso -o big.iso --expect 18d87568...
 dn get https://a/x.iso https://b/x.iso -o x.iso      # two mirrors, used together
-dn probe https://mirror.example/arxos.iso            # what the server will allow
+dn probe https://mirror.example/big.iso              # what the server will allow
 dn net                                               # the ways onto the internet you have
 dn serve --dir /srv/pool --token hunter2             # lend the engine to other machines
 ```
@@ -32,6 +34,21 @@ And one thing does not follow: if your own link is the bottleneck, none of this 
 here on a saturated 1.7 MB/s wifi link, parallel fetching was no faster than a single curl, which
 is the correct and honest result. It pays off against throttling mirrors, on lossy links where one
 connection stalls, and on machines with more than one way out.
+
+## Next to the usual tools
+
+| | dnengine | curl / wget | aria2 |
+| --- | --- | --- | --- |
+| several connections to one file | yes | no | yes |
+| several mirrors combined | yes | no | yes |
+| several **network interfaces** at once | yes | no | no |
+| hash checked after the download | built in | you do it | yes |
+| usable as a library | Rust crate, C ABI, or a socket | libcurl | RPC |
+| dependencies | none | none / none | several |
+
+The interface part is the unusual one. Wifi and ethernet and a tethered phone are three ways onto
+the internet, and this uses them together for a single file rather than whichever one the routing
+table picked.
 
 ## What it does when something goes wrong
 
@@ -95,4 +112,5 @@ mirrors as a second dimension of the same idea, and is built to be linked by oth
 
 ---
 
-Part of [ArxOS](https://arxos.uk). Belongs under Stingray Labs.
+MIT. Built by Stingray Labs, and used by [ArxOS](https://arxos.uk) among others, but it belongs
+to no particular distribution: if it only downloads files for you, it is doing its job.
