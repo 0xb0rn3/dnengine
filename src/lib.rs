@@ -1,30 +1,13 @@
-//! dnengine: a download engine that uses every connection you have.
+//! Reusable HTTP(S) batches, streaming and ranged downloads.
 //!
-//! One file, many connections, every network the machine has, and every mirror that serves it,
-//! all at once. Resumable, and verified against a hash when you have one.
-//!
-//! The layering, which is what makes this a shared engine rather than a downloader:
-//!
-//!   1. transport   one byte range over one connection. Today that is curl, which is on every
-//!                  machine and brings HTTP/2, proxies, redirects and TLS with it. The trait is
-//!                  here so a native io_uring transport can replace it without touching
-//!                  anything above.
-//!   2. scheduling  which connection fetches which block, including hedging a slow one. Ported
-//!                  from Plexo (MIT); see sched.rs.
-//!   3. lanes       a mirror paired with a network interface. Many mirrors and many interfaces
-//!                  multiply into lanes, and the scheduler routes around whichever is bad.
-//!   4. state       what has already landed, so an interrupted download continues rather than
-//!                  starting again.
-//!   5. integrity   the bytes are hashed as they are written, and checked against what the
-//!                  project published.
-//!
-//! This is meant to be used by other programs rather than typed by a person, the way aria2 or
-//! libcurl are: link the crate, link the C ABI, run the `dn` binary, or drive it over a socket.
-//! It is std only on purpose, so it builds on a machine with nothing installed and an empty cargo
-//! cache, which is often exactly the machine that needs to fetch something.
+//! `http::Client` retains a libcurl pool across batches and memory or streaming calls.
+//! `Download` splits one file across mirrors and interfaces with a selectable transport.
+//! Native transport is the default used by the C ABI, CLI and service. The crate has no
+//! Cargo dependencies; system libcurl and its development headers are required.
 
 pub mod batch;
 pub mod ffi;
+pub mod http;
 pub mod json;
 pub mod netif;
 pub mod probe;
@@ -85,13 +68,23 @@ impl Download {
     pub fn run<T: Transport + Sync, F: FnMut(&Progress)>(
         self, transport: &T, mut on_progress: F,
     ) -> Result<Outcome, String> {
+        self.run_cancellable(transport, &http::Cancellation::new(), &mut on_progress)
+    }
+
+    /// Cancellation is cooperative, including during probe, queueing and retry waits.
+    pub fn run_cancellable<T: Transport + Sync, F: FnMut(&Progress)>(
+        self, transport: &T, cancel: &http::Cancellation, mut on_progress: F,
+    ) -> Result<Outcome, String> {
         if self.urls.is_empty() { return Err("no url".into()); }
+        on_progress(&Progress { done: 0, total: 0, bytes_per_second: 0, connections: 0, duplicated: 0 });
+        if cancel.is_cancelled() { return Err("cancelled".into()); }
 
         // Probe every mirror. One that reports a different size is not serving the same file,
         // and mixing ranges from it would produce a corrupt result that still looks complete.
         let probes: Vec<(String, probe::Probe)> = self.urls.iter()
-            .map(|u| (u.clone(), probe::probe(u)))
+            .map(|u| (u.clone(), transport.probe(u, cancel.flag()).unwrap_or_else(|_| probe::parse(""))))
             .collect();
+        if cancel.is_cancelled() { return Err("cancelled".into()); }
         let size = probes.iter().map(|(_, p)| p.size).max().unwrap_or(0);
         if size == 0 { return Err("the server did not say how big the file is".into()); }
         let sources: Vec<String> = probes.iter()
@@ -127,7 +120,7 @@ impl Download {
         }
         if streams.is_empty() { return Err("no usable lane".into()); }
 
-        let file = OpenOptions::new().create(true).write(true).read(true).open(&self.dest)
+        let file = OpenOptions::new().create(true).truncate(false).write(true).read(true).open(&self.dest)
             .map_err(|e| format!("cannot open {}: {e}", self.dest.display()))?;
         file.set_len(size).map_err(|e| format!("cannot size {}: {e}", self.dest.display()))?;
         let file = Arc::new(file);
@@ -152,6 +145,9 @@ impl Download {
         let started = Instant::now();
 
         std::thread::scope(|scope| {
+            struct StopOnDrop<'a>(&'a AtomicBool);
+            impl Drop for StopOnDrop<'_> { fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); } }
+            let _stop_on_unwind = StopOnDrop(&stop);
             for (id, lane) in streams.iter().cloned() {
                 let (plan, file, fetched, duplicated, stop, failure) =
                     (Arc::clone(&plan), Arc::clone(&file), Arc::clone(&fetched),
@@ -194,7 +190,7 @@ impl Download {
                             &sources[lane.source], &lane.net, from, to, &stop,
                             &mut |offset: u64, bytes: &[u8]| {
                                 use std::os::unix::fs::FileExt;
-                                file2.write_at(bytes, offset)?;
+                                file2.write_all_at(bytes, offset)?;
                                 fetched2.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                                 Ok(())
                             },
@@ -248,6 +244,7 @@ impl Download {
             // the caller's view, updated a few times a second from the plan itself
             let mut last = (Instant::now(), 0u64);
             loop {
+                if cancel.is_cancelled() { stop.store(true, Ordering::Relaxed); }
                 let (done, finished) = {
                     let p = plan.lock().unwrap();
                     (p.done_bytes(), p.finished())
@@ -274,6 +271,7 @@ impl Download {
         on_progress(&Progress { done, total: size, bytes_per_second: 0,
                                 connections: streams.len(),
                                 duplicated: duplicated.load(Ordering::Relaxed) });
+        if cancel.is_cancelled() { return Err("cancelled".into()); }
         if !complete {
             let why = failure.lock().unwrap().clone()
                 .unwrap_or_else(|| "the download did not finish".into());

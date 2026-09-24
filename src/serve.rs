@@ -132,7 +132,7 @@ fn handle(mut stream: TcpStream, cfg: &Server) -> std::io::Result<()> {
 
     let mut out = stream.try_clone()?;
     let mut last = std::time::Instant::now();
-    let result = d.run(&transport::Curl::default(), |p| {
+    let result = d.run(&transport::Native::default(), |p| {
         if last.elapsed() < std::time::Duration::from_millis(400) && p.done < p.total { return; }
         last = std::time::Instant::now();
         let line = json::obj(&[("event", json::s("progress")), ("done", json::V::N(p.done)),

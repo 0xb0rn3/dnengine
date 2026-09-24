@@ -1,21 +1,9 @@
-//! Many small files, which is the workload the range splitter cannot help with.
-//!
-//! dnengine's parallel path splits ONE file across connections. That is the right answer for a
-//! 4GB image and the wrong answer for four thousand 2MB ones: a 2MB JPEG gains nothing from being
-//! cut into ranges, and the cost that actually dominates is per-file setup. Fetching them one
-//! process at a time, which is what this engine used to do, pays a process spawn, a TCP handshake
-//! and a TLS negotiation FOR EVERY FILE, and that is why importing it into something like a
-//! wallpaper fetcher was worth nothing.
-//!
-//! A batch is handed to a single transfer process holding one connection pool. Same host means
-//! the socket and the TLS session are reused, and over HTTP/2 the requests are multiplexed on one
-//! connection. The transfers run concurrently inside that process rather than as separate ones.
-//!
-//! The batch is chunked because a command line has a length limit, and ARG_MAX is not a thing to
-//! discover in production with someone's ten thousand file queue.
+//! Compatibility helpers for file batches. New embedders should keep a
+//! `http::Client` to retain its pool across calls and obtain per-item results.
+//! The native batch path has no subprocess command line or ARG_MAX limit.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
 
 /// One thing to fetch and where it goes.
 pub struct Item {
@@ -24,11 +12,9 @@ pub struct Item {
 }
 
 pub struct BatchOpts {
-    /// Concurrent transfers inside the one process. Above roughly 16 a single host stops going
-    /// faster and starts answering 429, so this is not a dial to turn up for its own sake.
+    /// Concurrent HTTP requests. A separate default cap of four applies to each origin.
     pub parallel: usize,
-    /// Attempts per file, with curl's own exponential backoff between them. Retries honour
-    /// Retry-After, which is what a rate limited host is asking for.
+    /// Additional attempts per file. The engine applies backoff and Retry-After.
     pub retries: u32,
     pub user_agent: String,
     pub connect_timeout: u32,
@@ -57,8 +43,10 @@ pub struct BatchResult {
 }
 
 /// Conservative room for the executable, the flags and the environment.
+#[cfg(test)]
 const ARG_BUDGET: usize = 96 * 1024;
 
+/// Legacy public helper, retained for source compatibility. Native batches do not use it.
 /// Split a batch so no single command line can overflow ARG_MAX.
 ///
 /// Returns index ranges rather than copies: a queue of ten thousand URLs should not be cloned to
@@ -82,70 +70,28 @@ pub fn chunks(items: &[Item], budget: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// Fetch every item, reusing connections. `progress` is called with (done, total) after each
-/// chunk; returning false asks the batch to stop.
+/// Fetch every item, reusing connections within the call. `progress` receives (done, total)
+/// on completion and at most every 50ms while waiting; false cancels active and queued items.
+/// Failed indexes always refer to input order. Use http::Client for detailed results,
+/// per-origin configuration, an external cancellation token and pooling across calls.
 pub fn fetch_many(
     items: &[Item],
     opts: &BatchOpts,
     mut progress: impl FnMut(usize, usize) -> bool,
 ) -> Result<BatchResult, String> {
-    let mut res = BatchResult::default();
-    if items.is_empty() {
-        return Ok(res);
-    }
-    for (from, to) in chunks(items, ARG_BUDGET) {
-        let slice = &items[from..to];
-        for it in slice {
-            if let Some(parent) = it.dest.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("{}: {e}", parent.display()))?;
-                }
-            }
-        }
-        let mut cmd = Command::new("curl");
-        cmd.args([
-            "-sS", "-L", "--fail",
-            "--parallel", "--parallel-max", &opts.parallel.to_string(),
-            "--retry", &opts.retries.to_string(), "--retry-connrefused",
-            "--connect-timeout", &opts.connect_timeout.to_string(),
-            "-A", &opts.user_agent,
-            // one line per transfer, so a partial failure is attributable to a file rather than
-            // sinking the whole batch
-            "-w", "%{exitcode} %{http_code} %{url_effective}\\n",
-        ]);
-        if opts.max_time > 0 {
-            cmd.args(["--max-time", &opts.max_time.to_string()]);
-        }
-        for it in slice {
-            cmd.arg("-o").arg(&it.dest).arg(&it.url);
-        }
-        let out = cmd.output().map_err(|e| format!("curl will not start: {e}"))?;
-        let report = String::from_utf8_lossy(&out.stdout);
-        let mut seen = 0usize;
-        for line in report.lines() {
-            let mut f = line.split_whitespace();
-            let code = f.next().unwrap_or("1");
-            if code == "0" {
-                res.ok += 1;
-            } else {
-                res.failed += 1;
-                res.failed_indexes.push(from + seen);
-            }
-            seen += 1;
-        }
-        // curl prints one -w line per transfer; anything it never reported did not happen
-        if seen < slice.len() {
-            for i in seen..slice.len() {
-                res.failed += 1;
-                res.failed_indexes.push(from + i);
-            }
-        }
-        if !progress(res.ok + res.failed, items.len()) {
-            break;
-        }
-    }
-    Ok(res)
+    let options = crate::http::Options {
+        parallel: opts.parallel,
+        retries: opts.retries,
+        user_agent: opts.user_agent.clone(),
+        connect_timeout: std::time::Duration::from_secs(opts.connect_timeout as u64),
+        timeout: std::time::Duration::from_secs(opts.max_time as u64),
+        ..Default::default()
+    };
+    let results = crate::http::Client::new()?.fetch_many(items, &options,
+        &crate::http::Cancellation::new(), &mut progress)?;
+    let failed_indexes: Vec<usize> = results.iter().filter(|r| r.status != crate::http::Status::Ok)
+        .map(|r| r.index).collect();
+    Ok(BatchResult { ok: items.len() - failed_indexes.len(), failed: failed_indexes.len(), failed_indexes })
 }
 
 /// Convenience for the common shape: a list of URLs into one directory, named by their last path
@@ -155,7 +101,7 @@ pub fn fetch_into(urls: &[String], dir: &Path, opts: &BatchOpts,
     let items: Vec<Item> = urls.iter().map(|u| {
         let name = u.rsplit('/').next().unwrap_or("download");
         let name = name.split(['?', '#']).next().unwrap_or(name);
-        Item { url: u.clone(), dest: dir.join(if name.is_empty() { "download" } else { name }) }
+        Item { url: u.clone(), dest: dir.join(if name.is_empty() || name == "." || name == ".." { "download" } else { name }) }
     }).collect();
     fetch_many(&items, opts, progress)
 }

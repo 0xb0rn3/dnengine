@@ -4,7 +4,7 @@
 //! proves ranges actually work rather than merely being advertised. Some mirrors advertise
 //! Accept-Ranges and then ignore the header.
 
-use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 pub struct Probe {
     pub size: u64,
@@ -13,21 +13,26 @@ pub struct Probe {
 }
 
 pub fn probe(url: &str) -> Probe {
-    let out = Command::new("curl")
-        .args(["-sS", "-L", "-D", "-", "-o", "/dev/null", "--max-time", "30", "-r", "0-0",
-               "-A", concat!("dnengine/", env!("CARGO_PKG_VERSION")), url])
-        .output();
-    let head = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-    parse(&head)
+    probe_cancellable(url, &AtomicBool::new(false)).unwrap_or_else(|_| parse(""))
+}
+
+pub fn probe_cancellable(url: &str, stop: &AtomicBool) -> Result<Probe, String> {
+    let options = crate::http::Options { total_timeout: std::time::Duration::from_secs(30), ..Default::default() };
+    let head = crate::http::Client::new()?.probe(url, &options, stop)?;
+    Ok(parse(&head))
 }
 
 pub fn parse(head: &str) -> Probe {
     let mut size = 0u64;
     let mut ranges = false;
     let mut filename = None;
+    let mut status = 0u16;
     for line in head.lines() {
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("content-range:") {
+        if lower.starts_with("http/") {
+            size = 0; ranges = false; filename = None;
+            status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        } else if status == 206 && lower.starts_with("content-range:") {
             // Content-Range: bytes 0-0/4223172608
             if let Some(total) = line.rsplit('/').next() {
                 if let Ok(n) = total.trim().parse::<u64>() { size = n; ranges = true; }
@@ -35,7 +40,8 @@ pub fn parse(head: &str) -> Probe {
         } else if lower.starts_with("content-length:") && size == 0 {
             if let Some(v) = line.split(':').nth(1) { size = v.trim().parse().unwrap_or(0); }
         } else if lower.starts_with("content-disposition:") {
-            if let Some(rest) = lower.split("filename=").nth(1) {
+            if let Some(at) = lower.find("filename=") {
+                let rest = &line[at + 9..];
                 let name = rest.trim().trim_matches(|c| c == '"' || c == '\'' || c == ';');
                 if !name.is_empty() { filename = Some(name.to_string()); }
             }

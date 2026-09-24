@@ -16,21 +16,6 @@ SHA=${3:-}
 set -- get "$URL" -o "$DEST" --json
 [ -n "$SHA" ] && set -- "$@" --expect "$SHA"
 
-dn "$@" | while IFS= read -r line; do
-    case "$line" in
-        *'"event":"progress"'*)
-            done_bytes=${line#*\"done\":}; done_bytes=${done_bytes%%,*}
-            total=${line#*\"total\":}; total=${total%%,*}
-            [ "$total" -gt 0 ] && printf '\r  %s of %s bytes ' "$done_bytes" "$total"
-            ;;
-        *'"event":"done"'*)
-            sha=${line#*\"sha256\":\"}; sha=${sha%%\"*}
-            printf '\n  ok %s\n  sha256 %s\n' "$DEST" "$sha"
-            ;;
-        *'"event":"error"'*)
-            msg=${line#*\"message\":\"}; msg=${msg%%\"*}
-            printf '\n  failed: %s\n' "$msg" >&2
-            exit 1
-            ;;
-    esac
-done
+# exec preserves dn's exit status, including loader errors and interrupted downloads.
+# JSON is emitted directly; consumers should use a real JSON parser for strings.
+exec dn "$@"

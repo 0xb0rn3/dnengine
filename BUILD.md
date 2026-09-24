@@ -1,84 +1,99 @@
-# Building and testing dnengine
+# Build and verify dnengine
 
-For whoever picks this up next, including Codex.
+Build on the host. Run all runtime tests in a throwaway diskless VM.
 
-## Layout
+## Requirements
 
-```
-src/lib.rs       the engine loop: threads, the shared plan, what happens to a block when an
-                 attempt comes back short, empty or late
-src/sched.rs     WHO FETCHES WHAT. Pure functions over a snapshot, each with a test that states
-                 an exact situation. Read this first; it is the whole idea.
-src/transport.rs the only part that talks to a network. A trait, so a native io_uring transport
-                 can replace curl without anything above it changing.
-src/probe.rs     what a server will allow, learned from a one byte ranged GET
-src/state.rs     the resume record, and why it is not always trusted
-src/netif.rs     the machine's ways onto the internet
-src/serve.rs     the engine over a socket, for machines that are not where the bandwidth is
-src/ffi.rs       the C ABI. Only primitives cross it, and a panic never unwinds into the caller
-src/sha256.rs    FIPS 180-4, portable and SHA extension paths, checked against each other
-include/         dnengine.h, the whole contract for non-Rust callers
-examples/        C, Go, Python, Rust and shell, all doing the same download
-```
+The crate has zero Cargo dependencies. The default HTTP backend links system libcurl,
+so zero Cargo dependencies does not mean zero system dependencies.
 
-## Build
+- Rust 1.85 or newer, a C compiler, and `ar`.
+- libcurl development headers and library, version 7.85 or newer, built with asynchronous
+  DNS and thread-safe initialization. HTTPS needs a TLS-enabled build and a CA trust store.
+- Linux/Unix is the current target. The range writer uses Unix file APIs. This session's
+  verification targets Linux x86_64; other targets are not verified.
+- `curl` on PATH only for the explicit legacy `transport::Curl` backend and its tests.
+- VM verification: QEMU x86_64, a readable Linux kernel, cpio, gzip, OpenSSL, Python,
+  iproute2, a shell, and the standard tools used by `tests/vm.py`.
+
+System libcurl keeps HTTP, TLS, proxy handling and protocol updates with the operating
+system. See [TRANSPORT.md](TRANSPORT.md) for the decision and compatibility changes.
+
+## Host builds
 
 ```sh
 cargo build --release
-# target/release/dn               the CLI
-# target/release/libdnengine.so   the C ABI, for everything else
-# target/release/libdnengine.a    same, static
+cargo test --no-run
+cc -Wall -Wextra -Werror -Iinclude examples/simple.c \
+  -Ltarget/release -ldnengine -o target/example-c
+cargo build --manifest-path examples/rust-app/Cargo.toml --release \
+  --target-dir target/example-build
+cp target/example-build/release/rust-app target/example-rust
+CGO_ENABLED=1 CGO_LDFLAGS="-L$PWD/target/release" \
+  go build -o target/example-go examples/app.go
 ```
 
-No dependencies, deliberately: this gets called on machines that have just been installed, or
-that are being rescued. Adding a crate to it is a decision, not a convenience.
+The Go compiler is optional for the engine build. If it is absent, the VM reports the
+Go example as unverified. C, Python, Rust and shell checks remain required. A Go toolchain
+was unavailable in the implementation session; do not describe that example as tested.
 
-## Test
+Outputs include `target/release/dn`, `libdnengine.so`, `libdnengine.a`, and the Rust rlib.
+`build.rs` compiles `native/curl.c` with system headers, avoiding handwritten variadic
+libcurl constants in Rust. `CC` and `AR` may be overridden. Cross builds also need the
+correct target libcurl headers and libraries; they are not supplied by this repository.
+
+For C with a static dnengine archive and dynamic system libraries:
 
 ```sh
-cargo test        # 23 unit tests, no network
+cc -Iinclude examples/simple.c target/release/libdnengine.a \
+  -lcurl -lpthread -ldl -lm -o target/example-c-static
 ```
 
-The engine itself is tested end to end in a throwaway VM against a real HTTP server, never on
-the host. The harness:
+This does not produce a fully static executable. Static libcurl needs its own transitive
+link flags, as reported by the target's `pkg-config --static --libs libcurl`.
+
+## Diskless runtime suite
 
 ```sh
-# on the host: a range capable server (python's SimpleHTTPServer IGNORES Range and will make
-# the engine look broken), optionally with SLOW=1 to make one block in four crawl
-python3 serve.py <dir> 8099
-SLOW=1 python3 serve.py <dir> 8098
-
-# the VM reaches the host at 10.0.2.2 through slirp; virtio_net is a module on Arch, so the
-# initramfs has to insmod failover, net_failover and virtio_net before configuring eth0
-qemu-system-x86_64 -enable-kvm -m 4096 -smp 4 -nographic -no-reboot \
-  -kernel /boot/vmlinuz-linux -initrd out/initramfs.cpio \
-  -append "console=ttyS0 panic=1 quiet rdinit=/init" \
-  -netdev user,id=n0 -device virtio-net-pci,netdev=n0
+python3 tests/vm.py
+# Optional: keep the initramfs tree for inspection
+python3 tests/vm.py --keep
 ```
 
-The five cases that must keep passing:
+Do not run `cargo test`, the examples, or `tests/bindings.py` directly on the host.
+The harness performs `cargo test --no-run` on the host, copies the test binaries,
+examples, Python modules and shared-library closure into an initramfs, then boots:
 
-1. 240 MB over 8 connections, sha256 matching exactly.
-2. an interrupted download resumes: kill it, check the record lists finished blocks, run the
-   same command and let it verify.
-3. two mirrors used together while one of them crawls, still verified.
-4. the same download driven through the C library (`examples/simple.c`).
-5. a deliberately wrong `--expect` is refused, exit non-zero.
+```text
+qemu-system-x86_64 -nographic -no-reboot -m 1024 -smp 2 -nic none \
+  -kernel /boot/vmlinuz-linux -initrd <temporary-initramfs> \
+  -append "console=ttyS0 quiet panic=1"
+```
 
-## What is easy to get wrong here
+It attaches no disks, NICs or host filesystem mounts. HTTP and TLS fixtures use only
+loopback inside the guest. Test files live in guest RAM. A fresh test certificate and key
+are generated for each initramfs and removed with it. `DN_VM_KERNEL` overrides the kernel.
+The complete console output is saved to `target/vm-output.log`.
 
-* **Never pin to an interface when there is only one.** Binding curl to `wlan0` cannot reach
-  `127.0.0.1`, and it fights VPN and policy routes. Pinning only pays when there are several
-  interfaces to add up; `is_local()` also keeps loopback targets unpinned.
-* **A hedge must never start while a block is still waiting.** That is the rule that keeps a
-  second attempt from stealing bandwidth from work that has not been done at all. The test
-  `hedging_never_steals_from_work_that_still_needs_doing` guards it.
-* **A block must never be stranded.** The avoid rule skips a lane that failed a block only while
-  another lane is free; with nothing else free the block is taken anyway.
-* **Mirrors that disagree about the size are not the same file.** `run()` drops any source whose
-  probe disagrees, rather than stitching ranges from two builds into one corrupt file that still
-  looks complete.
-* **The server binds localhost and requires a token otherwise**, and a request chooses a name,
-  never a path. Both are tested; do not relax either for convenience.
-* **No em-dashes** in anything user facing, and commits are authored
-  `0xb0rn3 | スティングレイ` with no trailers.
+The suite covers the existing unit tests, origin admission and retry timing, active and
+queued cancellation, stable item results, atomic batch output, memory limits, streaming,
+redirects, native ranges, error-pointer isolation, TLS certificate checks, in-memory ZIP
+processing, and the available language examples. It also compares native batching with
+one pooled `curl --parallel` process over TLS HTTP/1.1. This is a loopback regression
+fixture, not a measurement of internet throughput or HTTP/2 performance.
+
+## Source map
+
+| File | Responsibility |
+| --- | --- |
+| `src/http.rs` | Persistent clients, origin policy, redirects, retries, delivery and cancellation |
+| `native/curl.c`, `build.rs` | Typed system libcurl ABI shim and host build |
+| `src/batch.rs` | Existing batch API compatibility wrapper |
+| `src/transport.rs` | Native range transport and explicit legacy subprocess transport |
+| `src/lib.rs`, `src/sched.rs` | Range scheduling, progress, resume and hash verification |
+| `src/probe.rs` | Cancellable header probes and final-response parsing |
+| `src/ffi.rs`, `include/dnengine.h` | C ABI ownership, errors and concurrency contract |
+| `tests/vm.py`, `tests/http.rs`, `tests/bindings.py` | Diskless verification and reproducible measurements |
+
+Keep the MIT attribution in `src/sched.rs`. Use the repository's required author identity
+for commits and omit co-author trailers.

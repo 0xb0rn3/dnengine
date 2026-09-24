@@ -1,54 +1,109 @@
-"""Using the engine from Python, through the same C ABI that C uses.
+"""ctypes binding example. python3 examples/dn.py URL DEST [URL DEST ...]
 
-    python3 examples/dn.py https://host/file.iso /tmp/file.iso [sha256]
-
-No Python package to install and no HTTP code here: the engine does the work, so a Python tool
-gets multi connection, multi interface, resumable, verified downloads for the price of a ctypes
-call. Any language with a C FFI binds it the same way.
+fetch_many calls the stable convenience ABI. Client.batch returns individual
+results, and Client.bytes can feed zipfile.ZipFile(io.BytesIO(...)) directly.
 """
-import ctypes, sys, os
+import ctypes as C
+import os
+import sys
 
-LIB = os.environ.get("DNENGINE_LIB", "libdnengine.so")
-dn = ctypes.CDLL(LIB)
-
-PROGRESS = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64,
-                            ctypes.c_uint64, ctypes.c_int, ctypes.c_void_p)
-
-
-class Options(ctypes.Structure):
-    _fields_ = [("streams_per_lane", ctypes.c_int),
-                ("max_connections", ctypes.c_int),
-                ("expect_sha256", ctypes.c_char_p),
-                ("interfaces", ctypes.c_char_p),
-                ("no_resume", ctypes.c_int)]
+lib = C.CDLL(os.environ.get("DNENGINE_LIB", "libdnengine.so"))
+PROGRESS = C.CFUNCTYPE(C.c_int, C.c_uint64, C.c_uint64, C.c_uint64, C.c_int, C.c_void_p)
 
 
-dn.dn_download.argtypes = [ctypes.POINTER(ctypes.c_char_p), ctypes.c_int, ctypes.c_char_p,
-                           ctypes.POINTER(Options), PROGRESS, ctypes.c_void_p]
-dn.dn_last_error.restype = ctypes.c_char_p
-dn.dn_version.restype = ctypes.c_char_p
+class Options(C.Structure):
+    _fields_ = [(n, C.c_uint32) for n in (
+        "struct_size", "parallel", "per_host", "retries", "backoff_ms",
+        "max_backoff_ms", "connect_timeout_ms", "timeout_ms", "total_timeout_ms")]
+    _fields_ += [("ca_file", C.c_char_p)]
 
 
-def download(urls, dest, expect=None, streams=4):
-    def show(done, total, bps, conns, _user):
-        if total:
-            pct = done * 100 // total
-            print(f"\r  {pct:3d}%  {done:,} / {total:,} bytes  {bps/1e6:.1f} MB/s  {conns} conn ",
-                  end="", flush=True)
-        return 0
+class Result(C.Structure):
+    _fields_ = [("index", C.c_uint64), ("status", C.c_int), ("http_status", C.c_int),
+                ("transport_code", C.c_int), ("attempts", C.c_uint32),
+                ("bytes", C.c_uint64), ("error", C.c_char * 256)]
 
-    arr = (ctypes.c_char_p * len(urls))(*[u.encode() for u in urls])
-    opts = Options(streams, 0, expect.encode() if expect else None, None, 0)
-    rc = dn.dn_download(arr, len(urls), dest.encode(), ctypes.byref(opts), PROGRESS(show), None)
-    print()
-    if rc != 0:
-        raise RuntimeError(dn.dn_last_error().decode())
-    return dest
+
+def bind(name, args, result):
+    f = getattr(lib, name)
+    f.argtypes, f.restype = args, result
+    return f
+
+
+strings = C.POINTER(C.c_char_p)
+bind("dn_last_error", [], C.c_char_p)
+bind("dn_fetch_many", [strings, strings, C.c_int, C.c_int, PROGRESS, C.c_void_p], C.c_int)
+bind("dn_client_options_init", [C.POINTER(Options)], None)
+bind("dn_client_new", [C.POINTER(Options)], C.c_void_p)
+bind("dn_client_free", [C.c_void_p], None)
+bind("dn_fetch_many_ex", [C.c_void_p, strings, strings, C.c_size_t, C.POINTER(Result),
+                           C.c_void_p, PROGRESS, C.c_void_p], C.c_int)
+bind("dn_fetch_bytes", [C.c_void_p, C.c_char_p, C.c_size_t, C.POINTER(C.c_void_p),
+                         C.POINTER(C.c_size_t), C.POINTER(Result), C.c_void_p], C.c_int)
+bind("dn_buffer_free", [C.c_void_p, C.c_size_t], None)
+bind("dn_cancel_new", [], C.c_void_p)
+bind("dn_cancel", [C.c_void_p], None)
+bind("dn_cancel_free", [C.c_void_p], None)
+
+
+def arrays(items):
+    items = list(items)
+    return ((C.c_char_p * len(items))(*(str(u).encode() for u, _ in items)),
+            (C.c_char_p * len(items))(*(os.fspath(d).encode() for _, d in items)))
+
+
+def fetch_many(items, parallel=8):
+    urls, dests = arrays(items)
+    count = lib.dn_fetch_many(urls, dests, len(urls), parallel, PROGRESS(), None)
+    if count < 0:
+        raise RuntimeError(lib.dn_last_error().decode())
+    return count
+
+
+class Client:
+    def __init__(self, per_host=4, parallel=8):
+        opts = Options()
+        lib.dn_client_options_init(C.byref(opts))
+        opts.per_host, opts.parallel = per_host, parallel
+        self.ptr = lib.dn_client_new(C.byref(opts))
+        if not self.ptr:
+            raise RuntimeError(lib.dn_last_error().decode())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def close(self):
+        if self.ptr:
+            lib.dn_client_free(self.ptr)
+            self.ptr = None
+
+    def batch(self, items, cancel=None):
+        urls, dests = arrays(items)
+        results = (Result * len(urls))()
+        rc = lib.dn_fetch_many_ex(self.ptr, urls, dests, len(urls), results, cancel, PROGRESS(), None)
+        if rc:
+            raise RuntimeError(lib.dn_last_error().decode())
+        return list(results)
+
+    def bytes(self, url, max_bytes=16 * 1024 * 1024, cancel=None):
+        data, size, result = C.c_void_p(), C.c_size_t(), Result()
+        rc = lib.dn_fetch_bytes(self.ptr, url.encode(), max_bytes, C.byref(data),
+                               C.byref(size), C.byref(result), cancel)
+        if rc:
+            raise RuntimeError(lib.dn_last_error().decode())
+        try:
+            return C.string_at(data, size.value)
+        finally:
+            lib.dn_buffer_free(data, size)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        sys.exit(f"usage: {sys.argv[0]} <url> <dest> [sha256]")
-    print(dn.dn_version().decode())
-    download([sys.argv[1]], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
-    print("  ok", sys.argv[2])
+    if len(sys.argv) < 3 or len(sys.argv) % 2 != 1:
+        sys.exit(f"usage: {sys.argv[0]} URL DEST [URL DEST ...]")
+    jobs = list(zip(sys.argv[1::2], sys.argv[2::2]))
+    succeeded = fetch_many(jobs)
+    print(f"batch: {succeeded}/{len(jobs)} succeeded")
+    sys.exit(0 if succeeded == len(jobs) else 1)

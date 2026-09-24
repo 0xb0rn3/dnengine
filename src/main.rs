@@ -121,12 +121,12 @@ fn get(args: &[String], jsonl: bool) {
         v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
 
-    let curl = transport::Curl::default();
+    let curl = transport::Native::default();
 
     if args.iter().any(|a| a == "--single") {
         if !jsonl { println!("{BOLD}>>{RST} one connection, as asked"); }
         match dnengine::single(&curl, &urls[0], &dest) {
-            Ok(()) => finish(&dest, jsonl, None),
+            Ok(()) => finish(&dest, jsonl, opt(args, &["--expect"]).as_deref()),
             Err(e) => die(&e, jsonl),
         }
         return;

@@ -1,48 +1,42 @@
-/* Using the engine from C.
- *
- *   cc examples/simple.c -Iinclude -Ltarget/release -ldnengine -o /tmp/dnc
- *   LD_LIBRARY_PATH=target/release /tmp/dnc https://host/file.iso /tmp/file.iso
+/* cc -Iinclude examples/simple.c -Ltarget/release -ldnengine -o target/example-c
+ * usage: example-c <url> <dest> [url dest ...]
  */
-#include <stdio.h>
-#include <string.h>
 #include "dnengine.h"
+#include <stdio.h>
+#include <stdlib.h>
 
-static int on_progress(uint64_t done, uint64_t total, uint64_t bps, int conns, void *user)
-{
-    (void)user;
-    if (total) {
-        fprintf(stderr, "\r  %3llu%%  %llu / %llu bytes  %llu B/s  %d connections   ",
-                (unsigned long long)(done * 100 / total), (unsigned long long)done,
-                (unsigned long long)total, (unsigned long long)bps, conns);
-    }
-    return 0; /* non-zero would cancel */
-}
-
-int main(int argc, char **argv)
-{
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <url> <dest> [sha256]\n", argv[0]);
+int main(int argc, char **argv) {
+    if (argc < 3 || argc % 2 != 1) {
+        fprintf(stderr, "usage: %s <url> <dest> [url dest ...]\n", argv[0]);
         return 2;
     }
-    const char *urls[1] = { argv[1] };
-    dn_options opts;
-    memset(&opts, 0, sizeof opts);          /* zeroed means: sensible defaults */
-    opts.streams_per_lane = 4;
-    if (argc > 3) opts.expect_sha256 = argv[3];
-
-    printf("%s\n", dn_version());
-    uint64_t size = 0;
-    int ranges = dn_probe(argv[1], &size);
-    printf("  server: %llu bytes, ranges %s\n", (unsigned long long)size, ranges == 1 ? "yes" : "no");
-
-    int rc = dn_download(urls, 1, argv[2], &opts, on_progress, NULL);
-    fprintf(stderr, "\n");
-    if (rc != DN_OK) {
-        fprintf(stderr, "  failed (%d): %s\n", rc, dn_last_error());
-        return 1;
+    size_t n = (size_t)(argc - 1) / 2;
+    const char **urls = calloc(n, sizeof *urls), **dests = calloc(n, sizeof *dests);
+    dn_item_result *results = calloc(n, sizeof *results);
+    if (!urls || !dests || !results) { free(urls); free(dests); free(results); return 1; }
+    for (size_t i = 0; i < n; i++) { urls[i] = argv[1 + i*2]; dests[i] = argv[2 + i*2]; }
+    dn_client_options opts;
+    dn_client_options_init(&opts);
+    opts.per_host = 2;
+    dn_client *client = dn_client_new(&opts);
+    int failed = 0;
+    if (!client || dn_fetch_many_ex(client, urls, dests, n, results, NULL, NULL, NULL) != DN_OK) {
+        fprintf(stderr, "%s\n", dn_last_error()); failed = 1;
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            printf("%zu: status=%d HTTP=%d bytes=%llu %s\n", i, results[i].status,
+                   results[i].http_status, (unsigned long long)results[i].bytes, results[i].error);
+            if (results[i].status != DN_OK) failed = 1;
+        }
+        /* The same client's connection pool also serves bounded in-memory requests. */
+        uint8_t *data = NULL;
+        size_t len = 0;
+        if (dn_fetch_bytes(client, urls[0], 16*1024*1024, &data, &len, NULL, NULL) == DN_OK) {
+            printf("memory: %zu bytes\n", len);
+            dn_buffer_free(data, len);
+        } else { fprintf(stderr, "%s\n", dn_last_error()); failed = 1; }
     }
-    char hex[65];
-    if (dn_sha256_file(argv[2], hex) == DN_OK) printf("  sha256 %s\n", hex);
-    printf("  ok %s\n", argv[2]);
-    return 0;
+    dn_client_free(client);
+    free(urls); free(dests); free(results);
+    return failed;
 }
