@@ -33,7 +33,12 @@ between calls. Separate clients have independent limits.
 | Incremental processing | `Client::fetch_stream` | `dn_fetch_stream` |
 | One large file, ranges/mirrors/interfaces | `Download` with `transport::Native` | `dn_download` |
 
-The existing range scheduler is derived from Plexo (MIT, attribution in `src/sched.rs`).
+The range scheduler is derived from Plexo (MIT, attribution in `src/sched.rs`), and carries its
+current rules: a block nobody holds first, then a stretch a split left behind, then racing a block
+whose holder is clearly going to lose, then splitting the back half of the longest part in flight
+with the holder stopped at the split, so nothing is fetched twice. What is ours is the lane: an
+interface paired with a mirror, so the same rules route around a throttling mirror as well as a
+slow link.
 Parallel ranges can help with server connection limits or multiple routes. They do not
 add bandwidth when the caller's own link is already saturated. Resume and hash checks
 remain available for range downloads; use an expected hash when resuming.
